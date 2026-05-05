@@ -2,38 +2,97 @@ name: Build APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Code checkout
-      uses: actions/checkout@v3
+      # â”€â”€ 1. Checkout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Python 3.8 setup
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.8
+      # â”€â”€ 2. Python 3.8 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # Python 3.8 is required; newer versions (3.10+) break several
+      # python-for-android recipes that Buildozer depends on.
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
 
-    - name: System dependencies install
-      run: |
-        sudo apt update
-        sudo apt install -y \
-        build-essential git zip unzip openjdk-17-jdk \
-        autoconf libtool pkg-config \
-        zlib1g-dev libncurses5-dev libncursesw5-dev \
-        libtinfo6 cmake libffi-dev libssl-dev
+      # â”€â”€ 3. System dependencies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # These are required by python-for-android / Buildozer at build time.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk \
+            python3-pip python3-dev \
+            build-essential libffi-dev libssl-dev \
+            libsqlite3-dev sqlite3 \
+            ccache \
+            autoconf automake libtool \
+            pkg-config zlib1g-dev \
+            libncurses5-dev libncursesw5-dev \
+            libtinfo5 cmake \
+            libgstreamer1.0-dev gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
 
-    - name: Python dependencies fix install
-      run: |
-        python -m pip install --upgrade pip==23.2.1
-        pip install setuptools<58
-        pip install "cython<3.0"
-        pip install buildozer==1.4.0
-        pip install kivy==2.1.0
+      # â”€â”€ 4. Pin pip build-system tools FIRST â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # â€¢ setuptools>=58 removes use_2to3 which breaks Kivy & some p4a recipes.
+      #   Pin to <58 (57.5.0 is the last safe release on the 57.x line).
+      # â€¢ Cython 3.x changes the API in ways that break Kivy's C extensions.
+      #   Pin to <3 (0.29.x is the stable, Kivy-compatible series).
+      # â€¢ wheel is needed before installing anything that builds native exts.
+      # Order matters: upgrade pip first, then pin the rest.
+      - name: Pin pip, setuptools, Cython, and wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "setuptools==57.5.0" \
+            "Cython==0.29.37" \
+            "wheel==0.42.0"
 
-    - name: Build APK
-      run: |
-        buildozer android debug
+      # â”€â”€ 5. Install Buildozer and Kivy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # Installing after the pins above ensures both packages see the correct
+      # setuptools and can build their C extensions against Cython 0.29.x.
+      - name: Install Buildozer and Kivy
+        run: |
+          pip install \
+            "buildozer==1.5.0" \
+            "kivy==2.3.0"
+
+      # â”€â”€ 6. Android SDK / NDK cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # Buildozer downloads ~1 GB of SDK/NDK on a clean runner.
+      # Caching the ~/.buildozer directory cuts subsequent runs from ~20 min
+      # to ~3â€“4 min. The cache key rotates only when buildozer.spec changes.
+      - name: Cache Buildozer global directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      # â”€â”€ 7. Build the APK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      # 'android debug' produces an unsigned debug APK.
+      # JAVA_HOME must point to JDK 17 (set automatically by the apt install
+      # above on ubuntu-latest; override here if your runner differs).
+      - name: Build APK with Buildozer
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          buildozer -v android debug
+
+      # â”€â”€ 8. Upload the APK as a workflow artifact â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: bin/*.apk
+          if-no-files-found: error   # fail loudly if the build produced nothing
+          retention-days: 14
